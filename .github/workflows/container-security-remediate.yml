@@ -251,8 +251,10 @@ jobs:
               details = summary.get("after_details", [])
               closes_line = f"\nCloses #{issue_num}\n" if (issue_num and after["tracked_total"] == 0) else ""
               remaining_section = "\n".join(details) if details else "None."
+              assignee = owner_mention.lstrip("@").strip()
+              mention_prefix = f"{owner_mention} " if owner_mention else ""
               pr_body = (
-                  "Automated container security remediation.\n\n"
+                  f"{mention_prefix}Automated container security remediation.\n\n"
                   "### Vulnerability comparison\n\n"
                   "| Stage | CRITICAL | HIGH | MEDIUM | Total |\n"
                   "|---|---:|---:|---:|---:|\n"
@@ -269,10 +271,11 @@ jobs:
               body_file.write_text(pr_body, encoding="utf-8")
 
               existing_pr = run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", ".[0].number"], check=False).stdout.strip()
+              assignee_args = ["--add-assignee", assignee] if (existing_pr and assignee) else (["--assignee", assignee] if assignee else [])
               if existing_pr:
-                  run(["gh", "pr", "edit", existing_pr, "--body-file", "pr-body.md"])
+                  run(["gh", "pr", "edit", existing_pr, "--body-file", "pr-body.md", *assignee_args])
               else:
-                  run(["gh", "pr", "create", "--title", "chore(security): update container base and dependencies", "--body-file", "pr-body.md", "--head", branch])
+                  run(["gh", "pr", "create", "--title", "chore(security): update container base and dependencies", "--body-file", "pr-body.md", "--head", branch, *assignee_args])
               body_file.unlink(missing_ok=True)
 
               if ci_workflow:
