@@ -1,0 +1,296 @@
+name: Container security remediate
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: Path to Dockerfile relative to repository root
+        type: string
+        default: Dockerfile
+      context:
+        description: Docker build context path
+        type: string
+        default: .
+      image_name:
+        description: Temporary local image name used during scan
+        type: string
+        default: app-security-scan
+      severity:
+        description: Trivy severity filter
+        type: string
+        default: MEDIUM,HIGH,CRITICAL
+      ignore_unfixed:
+        description: Ignore vulnerabilities without a fixed version
+        type: boolean
+        default: true
+      lockfile_upgrade_cmd:
+        description: Optional command to upgrade app lockfile when base update alone is insufficient
+        type: string
+        default: ''
+      ci_workflow:
+        description: Workflow file name to dispatch on the remediation branch after PR creation
+        type: string
+        default: ci.yml
+      branch_name:
+        description: Branch name used for remediation PRs
+        type: string
+        default: chore/container-security-remediate
+      owner_mention:
+        description: GitHub handle to mention when manual intervention is needed
+        type: string
+        default: '@WisChang005'
+    secrets:
+      pr_token:
+        description: Optional PAT used to push and open PRs so pull_request workflows trigger automatically
+        required: false
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ secrets.pr_token || github.token }}
+      DOCKER_IMAGE: ${{ inputs.image_name }}
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.pr_token || github.token }}
+
+      - name: Checkout shared remediation helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: WisChang005/shared-workflows
+          path: _shared_workflows
+          persist-credentials: false
+
+      - name: Move helpers outside workspace
+        run: |
+          rm -rf "${{ runner.temp }}/shared-workflows"
+          mv _shared_workflows "${{ runner.temp }}/shared-workflows"
+
+      - name: Setup uv (when lockfile upgrade is configured)
+        if: inputs.lockfile_upgrade_cmd != ''
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Build baseline image
+        run: docker build -f "${{ inputs.dockerfile }}" -t "${DOCKER_IMAGE}:baseline" "${{ inputs.context }}"
+
+      - name: Scan baseline image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image_name }}:baseline
+          scanners: vuln
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          format: json
+          exit-code: '0'
+          output: trivy-baseline.json
+
+      - name: Evaluate baseline vulnerabilities
+        id: baseline
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          out = subprocess.check_output(
+              ["python3", f"{os.environ['RUNNER_TEMP']}/shared-workflows/scripts/remediate.py", "summarize", "trivy-baseline.json"],
+              text=True,
+          )
+          data = json.loads(out)["baseline"]
+          total = data["tracked_total"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"total={total}\n")
+              fh.write(f"critical={data['critical']}\n")
+              fh.write(f"high={data['high']}\n")
+              fh.write(f"medium={data['medium']}\n")
+          PY
+          echo "Baseline tracked vulnerabilities: ${{ steps.baseline.outputs.total }}"
+
+      - name: Update Dockerfile base digests
+        id: update_base
+        if: steps.baseline.outputs.total != '0'
+        run: |
+          python3 "${{ runner.temp }}/shared-workflows/scripts/remediate.py" update-dockerfile "${{ inputs.dockerfile }}" > update-base.json
+          cat update-base.json
+
+      - name: Build and rescan after base digest update
+        id: rescan_base
+        if: steps.baseline.outputs.total != '0' && hashFiles(inputs.dockerfile) != ''
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            docker build -f "${{ inputs.dockerfile }}" -t "${DOCKER_IMAGE}:remediated" "${{ inputs.context }}"
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            cp trivy-baseline.json trivy-after.json
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan remediated image (base update)
+        if: steps.rescan_base.outputs.built == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image_name }}:remediated
+          scanners: vuln
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          format: json
+          exit-code: '0'
+          output: trivy-after.json
+
+      - name: Run lockfile upgrade if vulnerabilities remain
+        id: lockfile_upgrade
+        if: steps.baseline.outputs.total != '0' && inputs.lockfile_upgrade_cmd != ''
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          out = subprocess.check_output(
+              ["python3", f"{os.environ['RUNNER_TEMP']}/shared-workflows/scripts/remediate.py", "summarize", "trivy-baseline.json", "trivy-after.json"],
+              text=True,
+          )
+          after_total = json.loads(out)["after"]["tracked_total"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"after_total={after_total}\n")
+          PY
+
+      - name: Execute lockfile upgrade command and rebuild
+        id: rebuild_lockfile
+        if: steps.lockfile_upgrade.outputs.after_total != '' && steps.lockfile_upgrade.outputs.after_total != '0'
+        run: |
+          before_status="$(git status --porcelain)"
+          eval "${{ inputs.lockfile_upgrade_cmd }}"
+          after_status="$(git status --porcelain)"
+          if [ "$before_status" != "$after_status" ]; then
+            docker build -f "${{ inputs.dockerfile }}" -t "${DOCKER_IMAGE}:remediated" "${{ inputs.context }}"
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan remediated image (after lockfile upgrade)
+        if: steps.rebuild_lockfile.outputs.built == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image_name }}:remediated
+          scanners: vuln
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          format: json
+          exit-code: '0'
+          output: trivy-after.json
+
+      - name: Evaluate remediation result and create PR or Issue
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          branch = "${{ inputs.branch_name }}"
+          ci_workflow = "${{ inputs.ci_workflow }}"
+          owner_mention = "${{ inputs.owner_mention }}"
+
+          def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+              return subprocess.run(cmd, text=True, capture_output=True, check=check)
+
+          # Clean up temporary scan files before checking git status.
+          after_file = Path("trivy-after.json")
+          base_file = Path("trivy-baseline.json")
+
+          if after_file.exists():
+              raw = run(["python3", f"{os.environ['RUNNER_TEMP']}/shared-workflows/scripts/remediate.py", "summarize", "trivy-baseline.json", "trivy-after.json"]).stdout
+          else:
+              raw = run(["python3", f"{os.environ['RUNNER_TEMP']}/shared-workflows/scripts/remediate.py", "summarize", "trivy-baseline.json"]).stdout
+
+          summary = json.loads(raw)
+          base = summary["baseline"]
+          after = summary.get("after", base)
+          reduced = summary.get("reduced", False)
+
+          for tmp in ("trivy-baseline.json", "trivy-after.json", "update-base.json"):
+              Path(tmp).unlink(missing_ok=True)
+
+          dirty = bool(run(["git", "status", "--porcelain"]).stdout.strip())
+
+          # Write GitHub Step Summary.
+          summary_lines = [
+              "### Container security remediation summary",
+              "",
+              "| Stage | CRITICAL | HIGH | MEDIUM | Total |",
+              "|---|---:|---:|---:|---:|",
+              f"| Baseline | {base['critical']} | {base['high']} | {base['medium']} | {base['tracked_total']} |",
+              f"| After remediation | {after['critical']} | {after['high']} | {after['medium']} | {after['tracked_total']} |",
+              "",
+          ]
+          Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text("\n".join(summary_lines), encoding="utf-8")
+
+          issue_title = "Container vulnerability scan findings"
+          existing_issue = run(
+              ["gh", "issue", "list", "--state", "open", "--search", f"in:title {issue_title}", "--json", "number,title", "--jq", f'.[] | select(.title == "{issue_title}") | .number'],
+              check=False,
+          ).stdout.strip().splitlines()
+          issue_num = existing_issue[0] if existing_issue else ""
+
+          if base["tracked_total"] == 0:
+              if issue_num:
+                  run(["gh", "issue", "close", issue_num, "--comment", f"No fixable vulnerabilities remain. See [workflow run]({run_url})."], check=False)
+              print("No fixable vulnerabilities found.")
+              raise SystemExit(0)
+
+          if dirty and reduced:
+              run(["git", "config", "user.name", "WisChang005"])
+              run(["git", "config", "user.email", "wistw.chang@gmail.com"])
+              run(["git", "checkout", "-B", branch])
+              run(["git", "add", "-A"])
+              run(["git", "commit", "-m", "chore(security): update container base and dependencies"])
+              run(["git", "push", "--force", "origin", branch])
+
+              diff_stat = run(["git", "diff", "--stat", "HEAD~1..HEAD"]).stdout.strip()
+              details = summary.get("after_details", [])
+              closes_line = f"\nCloses #{issue_num}\n" if (issue_num and after["tracked_total"] == 0) else ""
+              remaining_section = "\n".join(details) if details else "None."
+              pr_body = (
+                  "Automated container security remediation.\n\n"
+                  "### Vulnerability comparison\n\n"
+                  "| Stage | CRITICAL | HIGH | MEDIUM | Total |\n"
+                  "|---|---:|---:|---:|---:|\n"
+                  f"| Baseline | {base['critical']} | {base['high']} | {base['medium']} | {base['tracked_total']} |\n"
+                  f"| Remediated | {after['critical']} | {after['high']} | {after['medium']} | {after['tracked_total']} |\n\n"
+                  "### Changed files\n\n"
+                  f"```text\n{diff_stat}\n```\n\n"
+                  "### Remaining vulnerabilities\n\n"
+                  f"{remaining_section}\n\n"
+                  f"Workflow run: {run_url}\n"
+                  f"{closes_line}"
+              )
+              body_file = Path("pr-body.md")
+              body_file.write_text(pr_body, encoding="utf-8")
+
+              existing_pr = run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--jq", ".[0].number"], check=False).stdout.strip()
+              if existing_pr:
+                  run(["gh", "pr", "edit", existing_pr, "--body-file", "pr-body.md"])
+              else:
+                  run(["gh", "pr", "create", "--title", "chore(security): update container base and dependencies", "--body-file", "pr-body.md", "--head", branch])
+              body_file.unlink(missing_ok=True)
+
+              if ci_workflow:
+                  run(["gh", "workflow", "run", ci_workflow, "--ref", branch], check=False)
+              raise SystemExit(0)
+
+          # Fallback: vulnerabilities remain and could not be automatically reduced.
+          details = summary.get("after_details") or summary.get("baseline_details") or []
+          issue_body = (
+              f"{owner_mention} Trivy found vulnerabilities that could not be automatically reduced via base digest/lockfile updates.\n\n"
+              f"Workflow summary: {run_url}\n\n"
+              + "\n".join(details)
+          )
+          issue_file = Path("issue-body.md")
+          issue_file.write_text(issue_body, encoding="utf-8")
+          if issue_num:
+              run(["gh", "issue", "comment", issue_num, "--body-file", "issue-body.md"])
+          else:
+              run(["gh", "issue", "create", "--title", issue_title, "--body-file", "issue-body.md"])
+          issue_file.unlink(missing_ok=True)
+          PY
